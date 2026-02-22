@@ -1,0 +1,12 @@
+Description=Telegram Music Bot
+After=network.target
+
+[Service]
+User=anton
+WorkingDirectory=/home/anton/music-bot
+ExecStart=/home/anton/music-bot/venv/bin/python /home/anton/music-bot/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
