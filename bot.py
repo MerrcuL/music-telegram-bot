@@ -42,7 +42,6 @@ else:
     SEARCH_CACHE = {}
 
 # --- PLATFORM DETECTION ---
-# Platforms yt-dlp can handle directly
 YTDLP_DIRECT_PATTERNS = [
     r'youtube\.com/watch',
     r'youtu\.be/',
@@ -52,7 +51,6 @@ YTDLP_DIRECT_PATTERNS = [
     r'vk\.com/music',
 ]
 
-# Platforms that need resolving via song.link -> YouTube
 SONGLINK_RESOLVE_PATTERNS = [
     r'open\.spotify\.com',
     r'spotify\.link',
@@ -75,7 +73,7 @@ ytmusic = YTMusic()
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 
-# --- HELPER: DETECT IF MESSAGE IS A URL ---
+# --- HELPERS: URL DETECTION ---
 def is_url(text: str) -> bool:
     t = text.strip()
     return t.startswith("http://") or t.startswith("https://")
@@ -93,17 +91,14 @@ def get_url_type(url: str) -> str:
 
 # --- HELPER: RESOLVE VIA SONG.LINK (ODESLI) API ---
 def resolve_via_songlink(url: str) -> dict:
-    # Correct endpoint: api.song.link/v1-alpha.1/links
     api_url = f"https://api.song.link/v1-alpha.1/links?url={urllib.parse.quote(url)}&userCountry=US"
     req = urllib.request.Request(api_url, headers={"User-Agent": "MusicBot/1.0"})
     with urllib.request.urlopen(req, timeout=10) as response:
         data = json.loads(response.read().decode())
 
-    # linksByPlatform holds per-platform URLs directly
     links_by_platform = data.get("linksByPlatform", {})
     youtube_url = None
 
-    # Prefer regular YouTube, fall back to YouTube Music
     for platform in ("youtube", "youtubeMusic"):
         platform_data = links_by_platform.get(platform)
         if platform_data:
@@ -113,7 +108,6 @@ def resolve_via_songlink(url: str) -> dict:
     if not youtube_url:
         raise ValueError("No YouTube equivalent found via song.link for this URL.")
 
-    # Extract title/artist — find the first entity that has a title
     entities = data.get("entitiesByUniqueId", {})
     title = "Unknown Track"
     artist = "Unknown Artist"
@@ -138,6 +132,10 @@ def download_from_url(url: str) -> dict:
         }],
         'quiet': True,
         'noplaylist': True,
+        'socket_timeout': 30,
+        'retries': 3,
+        'fragment_retries': 3,
+        'http_chunk_size': 10485760,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=True)
@@ -247,20 +245,52 @@ def build_display(results, page, total_pages):
     return message_text, InlineKeyboardMarkup(keyboard)
 
 
+
+# --- HELPER: FIND ACTUAL OUTPUT FILE ---
+def find_output_file(directory: str, video_id: str) -> str | None:
+    """
+    yt-dlp + ffmpeg sometimes produce filenames like `<id>.mp3`, `<id>.webm.mp3`, etc.
+    This scans the temp dir for any mp3 containing the video_id in its name.
+    """
+    for fname in os.listdir(directory):
+        if video_id in fname and fname.endswith('.mp3'):
+            return os.path.join(directory, fname)
+    return None
+
+
 # --- HANDLERS ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS: return
     await update.message.reply_text(
-        "Welcome to Simple Music Bot.\n\n"
-        "🔎 <b>Search:</b> Send a song name (e.g., <i>Numb Linkin Park</i>)\n\n"
-        "🔗 <b>Download by link:</b> Send a URL from any supported platform:\n"
-        "  • YouTube / YouTube Music\n"
-        "  • SoundCloud\n"
-        "  • VK Music\n"
-        "  • Spotify → resolved via song.link\n"
-        "  • Yandex Music → resolved via song.link\n"
-        "  • Apple Music, Tidal, Deezer → resolved via song.link\n"
+        "👋 Welcome to <b>Simple Music Bot</b>.\n\n"
+        "🔎 Send a song name to search.\n"
+        "🔗 Send a link to download directly.\n\n"
+        "Use /help for full instructions.",
+        parse_mode='HTML'
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USERS: return
+    await update.message.reply_text(
+        "📖 <b>How to use this bot</b>\n\n"
+        "<b>🔎 Search</b>\n"
+        "Send any song name and the bot will search YouTube Music and YouTube.\n"
+        "Example: <i>Numb Linkin Park</i>\n"
+        "  • Results are shown in pages of 5\n"
+        "  • 🎵 = YouTube Music result\n"
+        "  • 📺 = YouTube result\n"
+        "  • Tap a number to download that track\n\n"
+        "<b>🔗 Download by link</b>\n"
+        "Send a URL and the bot downloads it directly.\n"
+        "Supported platforms:\n"
+        "  • YouTube / YouTube Music — direct\n"
+        "  • SoundCloud — direct\n"
+        "  • VK Music — direct\n"
+        "  • Spotify — resolved via song.link\n"
+        "  • Yandex Music — resolved via song.link\n"
+        "  • Apple Music, Tidal, Deezer — resolved via song.link\n"
         "  • song.link / odesli.co links",
         parse_mode='HTML'
     )
@@ -282,9 +312,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
     """Handles direct URL download — routes through song.link if needed."""
-    status_msg = await update.message.reply_text("🔗 Processing link...")
     loop = asyncio.get_running_loop()
     video_id = None
+    status_msg = await update.message.reply_text("🔗 Processing link...")
 
     try:
         url_type = get_url_type(url)
@@ -315,10 +345,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE, url: s
         else:
             await status_msg.edit_text("⬇️ Downloading...")
 
+        # Timeout covers download only — upload is separate
         try:
             info = await asyncio.wait_for(
                 loop.run_in_executor(None, lambda: download_from_url(download_url)),
-                timeout=120
+                timeout=300
             )
         except asyncio.TimeoutError:
             await status_msg.edit_text("❌ Download timed out. The file may be too large or the connection is slow.")
@@ -330,16 +361,21 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE, url: s
         video_id = info.get('id', '')
         file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
 
+        # Upload has no timeout — Telegram handles large files slowly but reliably
         await status_msg.edit_text("⬆️ Uploading...")
 
-        if os.path.exists(file_path):
-            with open(file_path, 'rb') as audio_file:
+        # Find the actual output file — ffmpeg may produce a slightly different name
+        actual_file = find_output_file(DOWNLOAD_DIR, video_id)
+        if actual_file:
+            with open(actual_file, 'rb') as audio_file:
                 await context.bot.send_audio(
                     chat_id=update.effective_chat.id,
                     audio=audio_file,
                     title=song_title,
                     performer=uploader,
-                    duration=duration
+                    duration=duration,
+                    read_timeout=120,
+                    write_timeout=120
                 )
             await status_msg.delete()
         else:
@@ -350,10 +386,14 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE, url: s
         await status_msg.edit_text(f"❌ Error: {e}")
 
     finally:
+        # Clean up all temp files matching this video_id
         if video_id:
-            file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            for fname in os.listdir(DOWNLOAD_DIR):
+                if video_id in fname:
+                    try:
+                        os.remove(os.path.join(DOWNLOAD_DIR, fname))
+                    except Exception:
+                        pass
 
 
 async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
@@ -408,7 +448,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("dl:"):
         video_id = data.split(":")[1]
-        await query.edit_message_text(text="⬇️ Downloading...\nWait a moment...")
+        await query.edit_message_text(text="⬇️ Downloading...")
 
         file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
 
@@ -422,14 +462,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }],
             'quiet': True,
             'noplaylist': True,
+            'socket_timeout': 30,
+            'retries': 3,
+            'fragment_retries': 3,
+            'http_chunk_size': 10485760,
         }
 
         try:
             loop = asyncio.get_running_loop()
-            info = await asyncio.wait_for(
-                loop.run_in_executor(None, lambda: download_song(ydl_opts, video_id)),
-                timeout=120
-            )
+            # Timeout covers download only — upload is separate
+            try:
+                info = await asyncio.wait_for(
+                    loop.run_in_executor(None, lambda: download_song(ydl_opts, video_id)),
+                    timeout=300
+                )
+            except asyncio.TimeoutError:
+                logging.error(f"Download timed out for video_id: {video_id}")
+                await query.message.edit_text("❌ Download timed out. The file may be too large or the connection is slow.")
+                return
 
             song_title = info.get('title', 'Unknown Track')
             uploader = info.get('uploader', 'Unknown Artist')
@@ -437,30 +487,36 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await query.edit_message_text(text="⬆️ Uploading...")
 
-            if os.path.exists(file_path):
-                with open(file_path, 'rb') as audio_file:
+            # Find the actual output file — ffmpeg may produce a slightly different name
+            actual_file = find_output_file(DOWNLOAD_DIR, video_id)
+            if actual_file:
+                with open(actual_file, 'rb') as audio_file:
                     await context.bot.send_audio(
                         chat_id=update.effective_chat.id,
                         audio=audio_file,
                         title=song_title,
                         performer=uploader,
-                        duration=duration
+                        duration=duration,
+                        read_timeout=120,
+                        write_timeout=120
                     )
                 await query.message.delete()
             else:
                 await query.message.edit_text("❌ Error: File not found after download.")
 
-        except asyncio.TimeoutError:
-            logging.error(f"Download timed out for video_id: {video_id}")
-            await query.message.edit_text("❌ Download timed out. The file may be too large or the connection is slow.")
 
         except Exception as e:
             logging.error(f"Download Error: {e}")
             await query.message.edit_text(f"❌ Error: {e}")
 
         finally:
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            # Clean up all temp files matching this video_id
+            for fname in os.listdir(DOWNLOAD_DIR):
+                if video_id in fname:
+                    try:
+                        os.remove(os.path.join(DOWNLOAD_DIR, fname))
+                    except Exception:
+                        pass
 
 
 def download_song(opts, video_id):
@@ -476,7 +532,7 @@ if __name__ == '__main__':
 
     application = ApplicationBuilder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", start_command))
+    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
