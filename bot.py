@@ -93,14 +93,17 @@ def get_url_type(url: str) -> str:
 
 # --- HELPER: RESOLVE VIA SONG.LINK (ODESLI) API ---
 def resolve_via_songlink(url: str) -> dict:
-    api_url = f"https://api.odesli.co/resolve?url={urllib.parse.quote(url)}"
+    # Correct endpoint: api.song.link/v1-alpha.1/links
+    api_url = f"https://api.song.link/v1-alpha.1/links?url={urllib.parse.quote(url)}&userCountry=US"
     req = urllib.request.Request(api_url, headers={"User-Agent": "MusicBot/1.0"})
     with urllib.request.urlopen(req, timeout=10) as response:
         data = json.loads(response.read().decode())
 
+    # linksByPlatform holds per-platform URLs directly
     links_by_platform = data.get("linksByPlatform", {})
     youtube_url = None
 
+    # Prefer regular YouTube, fall back to YouTube Music
     for platform in ("youtube", "youtubeMusic"):
         platform_data = links_by_platform.get(platform)
         if platform_data:
@@ -110,13 +113,15 @@ def resolve_via_songlink(url: str) -> dict:
     if not youtube_url:
         raise ValueError("No YouTube equivalent found via song.link for this URL.")
 
+    # Extract title/artist — find the first entity that has a title
     entities = data.get("entitiesByUniqueId", {})
     title = "Unknown Track"
     artist = "Unknown Artist"
-    if entities:
-        first_entity = next(iter(entities.values()))
-        title = first_entity.get("title", title)
-        artist = first_entity.get("artistName", artist)
+    for entity in entities.values():
+        if entity.get("title"):
+            title = entity.get("title", title)
+            artist = entity.get("artistName", artist)
+            break
 
     return {"youtube_url": youtube_url, "title": title, "artist": artist}
 
@@ -156,7 +161,7 @@ def search_hybrid(query):
     seen_ids = set()
 
     try:
-        music_results = ytmusic.search(query, filter="songs", limit=3)
+        music_results = ytmusic.search(query, filter="songs", limit=3)[:3]
         for item in music_results:
             video_id = item['videoId']
             if video_id in seen_ids:
