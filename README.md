@@ -128,7 +128,6 @@ sudo systemctl status music-bot
 | Pick a search result | Tap a number button (1–5)                      |
 | Browse result pages  | Use the ⬅️ / ➡️ buttons                        |
 | Cancel a search      | Tap the ❌ Cancel inline button                 |
-| Cancel a download    | Tap the **🚫 Cancel Download** keyboard button |
 
 
 ## Supported Link Platforms
