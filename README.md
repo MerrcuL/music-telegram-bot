@@ -2,7 +2,6 @@
 
 A private Telegram bot that searches for songs on **YouTube Music** and **YouTube**, downloads them, and sends MP3 files directly to you. Also supports downloading by link from **Spotify, SoundCloud, VK Music, Yandex Music**, and more.
 
----
 
 ## Features
 
@@ -10,7 +9,6 @@ Bot uses whitelist-based access to prevent unauthorized use and avoid copyright 
 
 Downloads from YouTube and YouTube Music are done with help of yt-dlp, and others are resolved with song.link and then also downloaded from YouTube. 
 
----
 
 ## Requirements
 
@@ -18,7 +16,6 @@ Downloads from YouTube and YouTube Music are done with help of yt-dlp, and other
 - `ffmpeg` installed on your system
 - A Telegram Bot Token (from [@BotFather](https://t.me/BotFather))
 
----
 
 ## Installation
 
@@ -67,7 +64,6 @@ ALLOWED_USERS=123456789,987654321
 > You can find your Telegram user ID by messaging [@userinfobot](https://t.me/userinfobot).
 
 
----
 
 ## Running the Bot
 
@@ -118,7 +114,6 @@ sudo systemctl status music-bot
 | View logs | `sudo journalctl -u music-bot -f` |
 | Disable autostart | `sudo systemctl disable music-bot` |
 
----
 
 ## Usage
 
@@ -135,7 +130,6 @@ sudo systemctl status music-bot
 | Cancel a search      | Tap the ❌ Cancel inline button                 |
 | Cancel a download    | Tap the **🚫 Cancel Download** keyboard button |
 
----
 
 ## Supported Link Platforms
 
