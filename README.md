@@ -64,7 +64,6 @@ ALLOWED_USERS=123456789,987654321
 - `TOKEN` — your bot token from BotFather
 - `ALLOWED_USERS` — comma-separated list of Telegram user IDs allowed to use the bot
 
-> [!info] Tip
 > You can find your Telegram user ID by messaging [@userinfobot](https://t.me/userinfobot).
 
 
@@ -152,7 +151,6 @@ sudo systemctl status music-bot
 | Deezer                  | Resolved via [song.link](https://song.link) → YouTube |
 | song.link / odesli.co   | Resolved via [song.link](https://song.link) → YouTube |
 
-> [!info] Links
 > Links starting with `http://` or `https://` are auto-detected — no special command needed.
 
 
