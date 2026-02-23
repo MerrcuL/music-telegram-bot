@@ -9,6 +9,8 @@ Bot uses whitelist-based access to prevent unauthorized use and avoid copyright 
 
 Downloads from YouTube and YouTube Music are done with help of yt-dlp, and others are resolved with song.link and then also downloaded from YouTube. 
 
+<img width="403" height="898" alt="music_screen" src="https://github.com/user-attachments/assets/d67c6f02-1246-475f-9fea-b4894bf13589" />
+
 
 ## Requirements
 
