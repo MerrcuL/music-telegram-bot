@@ -41,6 +41,37 @@ else:
     print("cachetools not installed. Using plain dict cache (no expiry). Run: pip install cachetools")
     SEARCH_CACHE = {}
 
+USER_SETTINGS_FILE = "users_data.json"
+AWAITING_STATS_FM_USERNAME = set()
+
+_settings_cache: dict | None = None  # in-memory cache — avoids disk reads on every setting access
+
+def load_settings() -> dict:
+    global _settings_cache
+    if _settings_cache is None:
+        if os.path.exists(USER_SETTINGS_FILE):
+            with open(USER_SETTINGS_FILE, "r") as f:
+                _settings_cache = json.load(f)
+        else:
+            _settings_cache = {}
+    return _settings_cache
+
+def save_settings(data: dict):
+    global _settings_cache
+    _settings_cache = data
+    with open(USER_SETTINGS_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+def get_user_setting(user_id, key, default=None):
+    data = load_settings()
+    user_str = str(user_id)
+    return data.get(user_str, {}).get(key, default)
+
+def set_user_setting(user_id, key, value):
+    data = load_settings()
+    data.setdefault(str(user_id), {})[key] = value
+    save_settings(data)
+
 # --- PLATFORM DETECTION ---
 YTDLP_DIRECT_PATTERNS = [
     r'youtube\.com/watch',
@@ -68,6 +99,7 @@ logging.basicConfig(
     level=logging.INFO
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 ytmusic = YTMusic()
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -108,21 +140,40 @@ def resolve_via_songlink(url: str) -> dict:
     if not youtube_url:
         raise ValueError("No YouTube equivalent found via song.link for this URL.")
 
-    entities = data.get("entitiesByUniqueId", {})
-    title = "Unknown Track"
-    artist = "Unknown Artist"
-    for entity in entities.values():
-        if entity.get("title"):
-            title = entity.get("title", title)
-            artist = entity.get("artistName", artist)
-            break
-
-    return {"youtube_url": youtube_url, "title": title, "artist": artist}
+    entity = next((e for e in data.get("entitiesByUniqueId", {}).values() if e.get("title")), {})
+    return {
+        "youtube_url": youtube_url,
+        "title": entity.get("title", "Unknown Track"),
+        "artist": entity.get("artistName", "Unknown Artist"),
+    }
 
 
-# --- HELPER: DOWNLOAD DIRECTLY FROM A URL ---
-def download_from_url(url: str) -> dict:
-    ydl_opts = {
+# --- HELPER: GET FULL SONG.LINK URL ---
+def get_songlink_url(video_id: str, original_url: str = None, title_hint: str = None) -> str | None:
+    try:
+        url = original_url
+        # If URL is missing or YouTube-based, try iTunes to get a canonical streaming URL
+        if not url or 'youtube.com' in url or 'youtu.be' in url:
+            if title_hint:
+                try:
+                    clean_title = re.sub(r'[\(\[].*?[\)\]]|official|video|audio|lyrics', '', title_hint, flags=re.IGNORECASE).strip()
+                    itunes_data = _http_get_json(f"https://itunes.apple.com/search?term={urllib.parse.quote(clean_title)}&limit=1&entity=song", timeout=3)
+                    if itunes_data and itunes_data.get("resultCount", 0) > 0:
+                        url = itunes_data["results"][0].get("trackViewUrl")
+                except Exception as e:
+                    logging.warning(f"iTunes fallback search failed: {e}")
+        if not url:
+            url = f"https://music.youtube.com/watch?v={video_id}"
+        data = _http_get_json(f"https://api.song.link/v1-alpha.1/links?url={urllib.parse.quote(url)}", timeout=5)
+        return data.get("pageUrl", f"https://song.link/y/{video_id}") if data else f"https://song.link/y/{video_id}"
+    except Exception as e:
+        logging.error(f"Failed to fetch song.link URL: {e}")
+        return f"https://song.link/y/{video_id}"
+
+
+# --- HELPER: COMMON YT-DLP OPTS ---
+def get_ydl_opts() -> dict:
+    return {
         'format': 'bestaudio/best',
         'outtmpl': f'{DOWNLOAD_DIR}/%(id)s.%(ext)s',
         'postprocessors': [{
@@ -137,14 +188,17 @@ def download_from_url(url: str) -> dict:
         'fragment_retries': 3,
         'http_chunk_size': 10485760,
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+
+
+# --- HELPER: DOWNLOAD DIRECTLY FROM A URL ---
+def download_from_url(url: str) -> dict:
+    with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
         return ydl.extract_info(url, download=True)
 
 
 # --- HELPER: FORMAT DURATION ---
 def format_duration(seconds):
     if seconds is None: return "??:??"
-    if isinstance(seconds, str) and ":" in seconds: return seconds
     try:
         seconds = int(seconds)
         m, s = divmod(seconds, 60)
@@ -175,74 +229,52 @@ def search_hybrid(query):
     except Exception as e:
         logging.error(f"YTMusic Search failed: {e}")
 
-    try:
-        opts = {'quiet': True, 'noplaylist': True, 'extract_flat': True}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"ytsearch7:{query}", download=False)
-            yt_entries = info.get('entries', [])
-            for item in yt_entries:
-                video_id = item['id']
-                if video_id in seen_ids:
-                    continue
-                seen_ids.add(video_id)
-                dur = format_duration(item.get('duration'))
-                combined_results.append({
-                    'id': video_id,
-                    'title': item['title'],
-                    'uploader': item.get('uploader', 'YouTube'),
-                    'duration_string': dur,
-                    'source': '📺'
-                })
-    except Exception as e:
-        logging.error(f"YouTube Search failed: {e}")
+    # Only fetch as many YT results as needed to reach 10 total
+    needed = max(0, 10 - len(combined_results))
+    if needed > 0:
+        try:
+            opts = {'quiet': True, 'noplaylist': True, 'extract_flat': True}
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(f"ytsearch{needed}:{query}", download=False)
+                yt_entries = info.get('entries', [])
+                for item in yt_entries:
+                    video_id = item['id']
+                    if video_id in seen_ids:
+                        continue
+                    seen_ids.add(video_id)
+                    dur = format_duration(item.get('duration'))
+                    combined_results.append({
+                        'id': video_id,
+                        'title': item['title'],
+                        'uploader': item.get('uploader', 'YouTube'),
+                        'duration_string': dur,
+                        'source': '📺'
+                    })
+        except Exception as e:
+            logging.error(f"YouTube Search failed: {e}")
 
     return combined_results
 
 
 # --- HELPER: BUILD DISPLAY (Text + Keyboard) ---
 def build_display(results, page, total_pages):
-    start_index = page * 5
-    end_index = start_index + 5
-    current_page_items = results[start_index:end_index]
+    items = results[page * 5:(page + 1) * 5]
 
-    text_lines = []
-    for idx, item in enumerate(current_page_items):
-        num = idx + 1
-        source = item['source']
-        title = item['title']
-        uploader = item['uploader']
-        duration = item['duration_string']
+    def fmt(idx, item):
+        src, title, uploader, dur = item['source'], item['title'], item['uploader'], item['duration_string']
+        prefix = f"{idx + 1}." if src == '📺' else f"{idx + 1}. {src}"
+        return f"{prefix} <b>{title}</b>\n    └ {uploader} ({dur})"
 
-        if source == '📺':
-            line = f"{num}. <b>{title}</b>\n    └ {uploader} ({duration})"
-        else:
-            line = f"{num}. {source} <b>{title}</b>\n    └ {uploader} ({duration})"
-        text_lines.append(line)
-
-    message_text = "\n\n".join(text_lines)
+    message_text = "\n\n".join(fmt(i, it) for i, it in enumerate(items))
     message_text += f"\n\n📖 <i>Page {page+1} of {total_pages}</i>"
 
-    keyboard = []
-    number_row = []
-    for idx, item in enumerate(current_page_items):
-        number_row.append(InlineKeyboardButton(str(idx + 1), callback_data=f"dl:{item['id']}"))
-    keyboard.append(number_row)
-
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"page:{page-1}"))
-    else:
-        nav_row.append(InlineKeyboardButton("🚫", callback_data="noop"))
-
-    nav_row.append(InlineKeyboardButton("❌ Cancel", callback_data="cancel"))
-
-    if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton("➡️", callback_data=f"page:{page+1}"))
-    else:
-        nav_row.append(InlineKeyboardButton("🚫", callback_data="noop"))
-    keyboard.append(nav_row)
-
-    return message_text, InlineKeyboardMarkup(keyboard)
+    number_row = [InlineKeyboardButton(str(i + 1), callback_data=f"dl:{it['id']}") for i, it in enumerate(items)]
+    nav_row = [
+        InlineKeyboardButton("⬅️", callback_data=f"page:{page-1}") if page > 0 else InlineKeyboardButton("🚫", callback_data="noop"),
+        InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
+        InlineKeyboardButton("➡️", callback_data=f"page:{page+1}") if page < total_pages - 1 else InlineKeyboardButton("🚫", callback_data="noop"),
+    ]
+    return message_text, InlineKeyboardMarkup([number_row, nav_row])
 
 
 
@@ -257,6 +289,71 @@ def find_output_file(directory: str, video_id: str) -> str | None:
             return os.path.join(directory, fname)
     return None
 
+def cleanup_files(video_id: str | None):
+    """Deletes all temporary files matching the video_id."""
+    if not video_id: return
+    for fname in os.listdir(DOWNLOAD_DIR):
+        if video_id in fname:
+            try:
+                os.remove(os.path.join(DOWNLOAD_DIR, fname))
+            except Exception:
+                pass
+
+
+# --- HELPER: BLOCKING HTTP GET → JSON ---
+def _http_get_json(url: str, timeout: int = 10) -> dict | None:
+    """Synchronous HTTP GET returning parsed JSON, or None on 404. Raises on other errors."""
+    req = urllib.request.Request(url, headers={"User-Agent": "MusicBot/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+
+
+# --- HELPER: DOWNLOAD SONG BY VIDEO ID ---
+def download_song(opts: dict, video_id: str) -> dict:
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=True)
+
+
+async def send_downloaded_audio(
+    update_or_query, context, user_id: int, video_id: str,
+    song_title: str, uploader: str, duration: int,
+    original_url: str = None, title_hint: str = None
+) -> bool:
+    """Helper to find the downloaded file, build the caption, and send the audio."""
+    actual_file = find_output_file(DOWNLOAD_DIR, video_id)
+    if not actual_file:
+        return False
+
+    caption = None
+    if video_id and get_user_setting(user_id, "include_song_link", False):
+        songlink_url = get_songlink_url(video_id, original_url, title_hint)
+        caption = f"<a href='{songlink_url}'>song.link</a>"
+
+    # Update objects expose .effective_chat; CallbackQuery exposes .message.chat_id
+    if hasattr(update_or_query, 'effective_chat') and update_or_query.effective_chat:
+        chat_id = update_or_query.effective_chat.id
+    else:
+        chat_id = update_or_query.message.chat_id
+
+    with open(actual_file, 'rb') as audio_file:
+        await context.bot.send_audio(
+            chat_id=chat_id,
+            audio=audio_file,
+            title=song_title,
+            performer=uploader,
+            duration=duration,
+            caption=caption,
+            parse_mode='HTML',
+            read_timeout=120,
+            write_timeout=120
+        )
+    return True
 
 # --- HANDLERS ---
 
@@ -275,12 +372,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS: return
     await update.message.reply_text(
         "📖 <b>How to use this bot</b>\n\n"
+        "<b>⚙️ Settings & integrations</b>\n"
+        "  • /settings — Bind stats.fm or toggle song.link URL generation\n"
+        "  • /now — Download your current or last played Spotify track (requires stats.fm binding)\n\n"
         "<b>🔎 Search</b>\n"
         "Send any song name and the bot will search YouTube Music and YouTube.\n"
         "Example: <i>Numb Linkin Park</i>\n"
         "  • Results are shown in pages of 5\n"
         "  • 🎵 = YouTube Music result\n"
-        "  • 📺 = YouTube result\n"
+        "  • The rest are all YouTube results\n"
         "  • Tap a number to download that track\n\n"
         "<b>🔗 Download by link</b>\n"
         "Send a URL and the bot downloads it directly.\n"
@@ -304,6 +404,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not text: return
 
+    if user_id in AWAITING_STATS_FM_USERNAME:
+        set_user_setting(user_id, "stats_fm_username", text)  # text is already stripped above
+        AWAITING_STATS_FM_USERNAME.remove(user_id)
+        await update.message.reply_text(f"✅ stats.fm username saved as <b>{text}</b>.", parse_mode='HTML')
+        return
+
     if is_url(text):
         await handle_link(update, context, text)
     else:
@@ -312,6 +418,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
     """Handles direct URL download — routes through song.link if needed."""
+    user_id = update.effective_user.id
     loop = asyncio.get_running_loop()
     video_id = None
     status_msg = await update.message.reply_text("🔗 Processing link...")
@@ -359,24 +466,18 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE, url: s
         uploader = info.get('uploader', 'Unknown Artist')
         duration = info.get('duration')
         video_id = info.get('id', '')
-        file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
 
         # Upload has no timeout — Telegram handles large files slowly but reliably
         await status_msg.edit_text("⬆️ Uploading...")
 
         # Find the actual output file — ffmpeg may produce a slightly different name
-        actual_file = find_output_file(DOWNLOAD_DIR, video_id)
-        if actual_file:
-            with open(actual_file, 'rb') as audio_file:
-                await context.bot.send_audio(
-                    chat_id=update.effective_chat.id,
-                    audio=audio_file,
-                    title=song_title,
-                    performer=uploader,
-                    duration=duration,
-                    read_timeout=120,
-                    write_timeout=120
-                )
+        success = await send_downloaded_audio(
+            update, context, user_id, video_id, 
+            song_title, uploader, duration, 
+            original_url=download_url, title_hint=f"{uploader} {song_title}"
+        )
+        
+        if success:
             await status_msg.delete()
         else:
             await status_msg.edit_text("❌ Error: File not found after download.")
@@ -386,14 +487,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE, url: s
         await status_msg.edit_text(f"❌ Error: {e}")
 
     finally:
-        # Clean up all temp files matching this video_id
-        if video_id:
-            for fname in os.listdir(DOWNLOAD_DIR):
-                if video_id in fname:
-                    try:
-                        os.remove(os.path.join(DOWNLOAD_DIR, fname))
-                    except Exception:
-                        pass
+        cleanup_files(video_id)
 
 
 async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
@@ -424,8 +518,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    data = query.data
     user_id = update.effective_user.id
+    if user_id not in ALLOWED_USERS:
+        return
+
+    data = query.data
+
+    if data.startswith("settings:"):
+        action = data.split(":")[1]
+        
+        if action == "bind_stats_fm":
+            AWAITING_STATS_FM_USERNAME.add(user_id)
+            await query.message.reply_text("💬 Please send your stats.fm username (make sure your profile is public):")
+            return
+            
+        elif action == "toggle_song_link":
+            new_val = not get_user_setting(user_id, "include_song_link", False)
+            set_user_setting(user_id, "include_song_link", new_val)
+            await query.edit_message_text(
+                f"⚙️ <b>Settings</b>\n\nstats.fm username: <code>{get_user_setting(user_id, 'stats_fm_username', 'None')}</code>\n",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Bind stats.fm account", callback_data="settings:bind_stats_fm")],
+                    [InlineKeyboardButton(f"Include song.link: {'ON' if new_val else 'OFF'}", callback_data="settings:toggle_song_link")],
+                ]),
+                parse_mode='HTML'
+            )
+            return
 
     if data.startswith("page:"):
         new_page = int(data.split(":")[1])
@@ -450,30 +568,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         video_id = data.split(":")[1]
         await query.edit_message_text(text="⬇️ Downloading...")
 
-        file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
-
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': f'{DOWNLOAD_DIR}/%(id)s.%(ext)s',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-            'quiet': True,
-            'noplaylist': True,
-            'socket_timeout': 30,
-            'retries': 3,
-            'fragment_retries': 3,
-            'http_chunk_size': 10485760,
-        }
-
         try:
             loop = asyncio.get_running_loop()
             # Timeout covers download only — upload is separate
             try:
                 info = await asyncio.wait_for(
-                    loop.run_in_executor(None, lambda: download_song(ydl_opts, video_id)),
+                    loop.run_in_executor(None, lambda: download_song(get_ydl_opts(), video_id)),
                     timeout=300
                 )
             except asyncio.TimeoutError:
@@ -488,41 +588,144 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(text="⬆️ Uploading...")
 
             # Find the actual output file — ffmpeg may produce a slightly different name
-            actual_file = find_output_file(DOWNLOAD_DIR, video_id)
-            if actual_file:
-                with open(actual_file, 'rb') as audio_file:
-                    await context.bot.send_audio(
-                        chat_id=update.effective_chat.id,
-                        audio=audio_file,
-                        title=song_title,
-                        performer=uploader,
-                        duration=duration,
-                        read_timeout=120,
-                        write_timeout=120
-                    )
+            success = await send_downloaded_audio(
+                update, context, user_id, video_id, 
+                song_title, uploader, duration, 
+                title_hint=f"{uploader} {song_title}"
+            )
+            
+            if success:
                 await query.message.delete()
             else:
                 await query.message.edit_text("❌ Error: File not found after download.")
-
 
         except Exception as e:
             logging.error(f"Download Error: {e}")
             await query.message.edit_text(f"❌ Error: {e}")
 
         finally:
-            # Clean up all temp files matching this video_id
-            for fname in os.listdir(DOWNLOAD_DIR):
-                if video_id in fname:
-                    try:
-                        os.remove(os.path.join(DOWNLOAD_DIR, fname))
-                    except Exception:
-                        pass
+            cleanup_files(video_id)
 
 
-def download_song(opts, video_id):
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=True)
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USERS: return
+    username = get_user_setting(user_id, "stats_fm_username", "None")
+    songlink_on = get_user_setting(user_id, "include_song_link", False)
+    await update.message.reply_text(
+        f"⚙️ <b>Settings</b>\n\n"
+        f"stats.fm username: <code>{username}</code>\n",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Bind stats.fm account", callback_data="settings:bind_stats_fm")],
+            [InlineKeyboardButton(f"Include song.link: {'ON' if songlink_on else 'OFF'}", callback_data="settings:toggle_song_link")],
+        ]),
+        parse_mode='HTML'
+    )
+
+
+async def now_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USERS: return
+
+    username = get_user_setting(user_id, "stats_fm_username")
+    if not username or username == "None":
+        await update.message.reply_text("❌ You haven't bound your stats.fm account yet. Use /settings to bind it.")
+        return
+
+    status_msg = await update.message.reply_text(f"🎧 Fetching current track...")
+
+    video_id = None  # ensure cleanup_files always has a value to work with
+    try:
+        loop = asyncio.get_running_loop()
+
+        # --- Fetch current track ---
+        current_url = f"https://api.stats.fm/api/v1/users/{urllib.parse.quote(username)}/streams/current"
+        data = await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: _http_get_json(current_url)),
+            timeout=15
+        )
+
+        track_info = None
+        if data and data.get("item"):
+            track_info = data["item"].get("track", {})
+            status_text = "Currently playing"
+        else:
+            # Fallback to most recent track
+            await status_msg.edit_text(f"🎧 Nothing playing right now. Fetching most recent track...")
+            recent_url = f"https://api.stats.fm/api/v1/users/{urllib.parse.quote(username)}/streams/recent"
+            recent_data = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: _http_get_json(recent_url)),
+                timeout=15
+            )
+            if recent_data and recent_data.get("items"):
+                track_info = recent_data["items"][0].get("track", {})
+                status_text = "Last played"
+
+        if not track_info:
+            await status_msg.edit_text("❌ No recent tracks found or stats.fm profile is private.")
+            return
+
+        track_name = track_info.get("name", "")
+        artists = track_info.get("artists", [])
+        artist_name = artists[0].get("name", "") if artists else ""
+        spotify_ids = track_info.get("externalIds", {}).get("spotify", [])
+        spotify_url = f"https://open.spotify.com/track/{spotify_ids[0]}" if spotify_ids else None
+
+        # Search YTMusic directly — stats.fm already gives us clean metadata, no need for song.link here.
+        # spotify_url is still passed through so song.link captions prefer the Spotify URL over YouTube.
+        search_query = f"{artist_name} {track_name}".strip()
+        if not search_query:
+            await status_msg.edit_text("❌ Could not extract track information from stats.fm.")
+            return
+
+        await status_msg.edit_text(
+            f"🔎 {status_text} track:\n<b>{artist_name} - {track_name}</b>\nStarting download...",
+            parse_mode='HTML'
+        )
+        results = await loop.run_in_executor(None, lambda: search_hybrid(search_query))
+        if not results:
+            await status_msg.edit_text(
+                f"❌ Could not find <b>{artist_name} - {track_name}</b> on YouTube.",
+                parse_mode='HTML'
+            )
+            return
+
+        best_result = results[0]
+        video_id = best_result['id']
+        await status_msg.edit_text(f"⬇️ Downloading <b>{best_result['title']}</b>...", parse_mode='HTML')
+
+        try:
+            info = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: download_song(get_ydl_opts(), video_id)),
+                timeout=300
+            )
+        except asyncio.TimeoutError:
+            await status_msg.edit_text("❌ Download timed out. The file may be too large or the connection is slow.")
+            return
+
+        song_title = info.get('title', 'Unknown Track')
+        uploader = info.get('uploader', 'Unknown Artist')
+        duration = info.get('duration')
+
+        await status_msg.edit_text("⬆️ Uploading...")
+        success = await send_downloaded_audio(
+            update, context, user_id, video_id,
+            song_title, uploader, duration,
+            original_url=spotify_url,          # Spotify URL preferred for better song.link caption
+            title_hint=f"{artist_name} {track_name}"  # clean stats.fm metadata, not yt-dlp title
+        )
+
+        if success:
+            await status_msg.delete()
+        else:
+            await status_msg.edit_text("❌ Error: File not found after download.")
+
+    except Exception as e:
+        logging.error(f"Now Command Error: {e}")
+        await status_msg.edit_text(f"❌ Error: {e}")
+
+    finally:
+        cleanup_files(video_id)
 
 
 if __name__ == '__main__':
@@ -533,6 +736,8 @@ if __name__ == '__main__':
     application = ApplicationBuilder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("settings", settings_command))
+    application.add_handler(CommandHandler("now", now_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_callback))
 

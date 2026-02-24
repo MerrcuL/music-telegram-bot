@@ -9,6 +9,10 @@ Bot uses whitelist-based access to prevent unauthorized use and avoid copyright 
 
 Downloads from YouTube and YouTube Music are done with help of yt-dlp, and others are resolved with song.link and then also downloaded from YouTube. 
 
+- **Direct Download & Search**: Query by song name or provide direct links to Spotify, SoundCloud, YouTube, etc.
+- **stats.fm /now Integration**: Bind your stats.fm account to instantly download the track you are currently listening to on Spotify via `/now`.
+- **Platform Agnostic Links**: Optionally append a universal `song.link` to downloaded tracks so you can easily share music with friends on Apple Music or other platforms.
+
 <img width="403" height="898" alt="music_screenshot" src="https://github.com/user-attachments/assets/be9890b9-ecf9-46d6-9427-1cf1d7b2f95e" />
 
 
@@ -125,6 +129,8 @@ sudo systemctl status music-bot
 | -------------------- | ---------------------------------------------- |
 | Get started          | Send `/start`                                  |
 | Show help            | Send `/help`                                   |
+| Manage settings      | Send `/settings` to manage stats.fm & song.link|
+| Download current song| Send `/now` (requires stats.fm bound)          |
 | Search for a song    | Type a song name, e.g. `Numb Linkin Park`      |
 | Download by link     | Paste any supported URL (see below)            |
 | Pick a search result | Tap a number button (1–5)                      |
