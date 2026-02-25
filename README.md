@@ -1,157 +1,133 @@
-# 🎵 Music Telegram Bot
+# 🎵 Music Telegram Bot with Inline Mode
 
-A private Telegram bot that searches for songs on **YouTube Music** and **YouTube**, downloads them, and sends MP3 files directly to you. Also supports downloading by link from **Spotify, SoundCloud, VK Music, Yandex Music**, and more.
+A private Telegram bot that searches for songs on YouTube Music and YouTube, downloads them, and sends MP3 files directly to you. Now with **inline mode** support!
 
-
-## Features
-
-Bot uses whitelist-based access to prevent unauthorized use and avoid copyright issues.
-
-Downloads from YouTube and YouTube Music are done with help of yt-dlp, and others are resolved with song.link and then also downloaded from YouTube. 
+## ✨ Features
 
 - **Direct Download & Search**: Query by song name or provide direct links to Spotify, SoundCloud, YouTube, etc.
-- **stats.fm /now Integration**: Bind your stats.fm account to instantly download the track you are currently listening to on Spotify via `/now`.
-- **Platform Agnostic Links**: Optionally append a universal `song.link` to downloaded tracks so you can easily share music with friends on Apple Music or other platforms.
+- **Inline Mode**: Use `@botusername` in any chat to search and share music without leaving the conversation
+- **stats.fm Integration**: Bind your stats.fm account to instantly download your currently playing or last played Spotify track
+- **Smart Caching**: Audio files are cached in a dummy chat for faster subsequent shares
+- **Platform Agnostic Links**: Optionally append Spotify link and/or universal song.link to downloaded tracks
+- **Accurate Spotify Matching**: Uses song.link API and ISRC matching for precise Spotify → YouTube track mapping
 
-<img width="403" height="898" alt="music_screenshot" src="https://github.com/user-attachments/assets/be9890b9-ecf9-46d6-9427-1cf1d7b2f95e" />
+## 🆕 New: Inline Mode
 
+Type `@botusername` in any chat to:
+- **Empty query**: See your currently playing / last played track (if stats.fm is connected)
+- **Type a song name**: Search and share music directly in any chat
 
-## Requirements
+> **Note about "sent via @bot" label**: This is a Telegram client-side feature that cannot be disabled via API. It's shown to indicate content comes from a bot for security reasons.
 
-- Python 3.10+
-- `ffmpeg` installed on your system
-- A Telegram Bot Token (from [@BotFather](https://t.me/BotFather))
+## 📋 Prerequisites
 
+1. **Telegram Bot Token**: Get one from [@BotFather](https://t.me/BotFather)
+   - Use `/setinline` command to enable inline mode
+   - Use `/setinlinefeedback` to enable inline feedback (required for the bot to know when a result is selected)
 
-## Installation
+2. **Dummy Chat for Caching**:
+   - Create a private group or channel
+   - Add your bot to it
+   - Get the chat ID (you can use [@userinfobot](https://t.me/userinfobot) or [@getidsbot](https://t.me/getidsbot))
 
-**1. Clone the repository**
+3. **Python 3.8+**
 
+## 🚀 Installation
+
+1. Clone the repository:
 ```bash
 git clone https://github.com/MerrcuL/music-telegram-bot.git
 cd music-telegram-bot
 ```
 
-**2. Create and activate a virtual environment**
-
+2. Install dependencies:
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+pip install -r requirements.txt
 ```
 
-**3. Install Python dependencies**
-
-```bash
-pip install python-telegram-bot ytmusicapi yt-dlp python-dotenv cachetools
-```
-
-**4. Install FFmpeg**
-
-On Debian/Ubuntu:
-```bash
-sudo apt install ffmpeg
-```
-
-On macOS (with Homebrew):
-```bash
-brew install ffmpeg
-```
-
-**5. Create a `.env` file**
-
+3. Create a `.env` file:
 ```env
 TOKEN=your_telegram_bot_token_here
 ALLOWED_USERS=123456789,987654321
+DUMP_CHAT_ID=-1001234567890
 ```
 
-- `TOKEN` — your bot token from BotFather
-- `ALLOWED_USERS` — comma-separated list of Telegram user IDs allowed to use the bot
+### Environment Variables
 
-> You can find your Telegram user ID by messaging [@userinfobot](https://t.me/userinfobot).
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `TOKEN` | Your Telegram bot token from @BotFather | ✅ Yes |
+| `ALLOWED_USERS` | Comma-separated list of Telegram user IDs allowed to use the bot | ✅ Yes |
+| `DUMP_CHAT_ID` | Chat ID for caching audio files (required for inline mode) | ⚠️ Required for inline mode |
 
+## 🤖 Setting Up Inline Mode
 
+1. Go to [@BotFather](https://t.me/BotFather)
+2. Send `/setinline` and select your bot
+3. Set the placeholder text (e.g., "Search for music...")
+4. Send `/setinlinefeedback` and select your bot
+5. Choose "Enabled" to receive feedback when users select results
 
-## Running the Bot
+## 📖 Usage
 
-### Option A — Manual (foreground)
+### Regular Commands
 
-```bash
-source venv/bin/activate
-python bot.py
-```
+- **Search**: Send any song name
+- **Download by link**: Send a URL from YouTube, Spotify, Yandex Music, etc.
+- `/settings` - Configure stats.fm integration and song.link options
+- `/now` - Download your currently playing Spotify track (requires stats.fm)
+- `/help` - Show help message
 
-### Option B — systemd service (recommended for servers)
+### Inline Mode
 
-This runs the bot as a background service that starts automatically on boot and restarts on failure.
+In any chat, type:
+- `@botusername` - Shows your currently playing / last played track (if stats.fm connected)
+- `@botusername song name` - Search for a song
 
-**1. Edit the service file**
+When you select a result, the bot will:
+1. Download the track (if not cached)
+2. Upload it to the dump chat for caching
+3. Send the audio to the current chat
 
-Open `music-bot.service` and adjust the `User` and paths if your username or install directory differs from the defaults:
+## 🗄️ Audio Caching
 
-```ini
-[Service]
-User=anton                                          # your Linux username
-WorkingDirectory=/home/anton/music-bot              # path to the repo
-ExecStart=/home/anton/music-bot/venv/bin/python /home/anton/music-bot/bot.py
-```
+The bot uses a SQLite database (`audio_cache.db`) to store Telegram file IDs of downloaded tracks. This means:
+- **Faster shares**: Subsequent shares of the same track are instant
+- **Less bandwidth**: No need to re-download tracks
+- **Better reliability**: Cached files are served directly from Telegram's servers
 
-**2. Install and enable the service**
+## 🔒 Security
 
-```bash
-sudo cp music-bot.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable music-bot
-sudo systemctl start music-bot
-```
+- Whitelist-based access control via `ALLOWED_USERS`
+- Only configured users can use the bot
+- Private bot to prevent unauthorized access
 
-**3. Check that it's running**
+## 🐛 Troubleshooting
 
-```bash
-sudo systemctl status music-bot
-```
+### Inline mode sends placeholder audio instead of actual song
 
-**Common service commands:**
+If you select a song in inline mode but receive a silent/placeholder audio file:
 
-| Action | Command |
-|---|---|
-| Start | `sudo systemctl start music-bot` |
-| Stop | `sudo systemctl stop music-bot` |
-| Restart | `sudo systemctl restart music-bot` |
-| View logs | `sudo journalctl -u music-bot -f` |
-| Disable autostart | `sudo systemctl disable music-bot` |
+1. **Check DUMP_CHAT_ID**: Make sure it's set correctly in your `.env` file
+2. **Bot permissions**: Ensure the bot is a member of the dump chat and can send audio files
+3. **Check logs**: Look for error messages in the bot logs
+4. **Inline feedback**: Make sure you enabled `/setinlinefeedback` in @BotFather
 
+### The downloaded song doesn't match the Spotify track exactly
 
-## Usage
+The bot now uses multiple strategies for accurate matching:
+1. **song.link API**: Direct mapping from Spotify to YouTube
+2. **ISRC matching**: Uses iTunes API to find the exact recording
+3. **Fuzzy search**: Enhanced search with artist + title scoring
 
-**In Telegram:**
+If you still get mismatches, the track may not be available on YouTube or may have different metadata.
 
-| Action               | How                                            |
-| -------------------- | ---------------------------------------------- |
-| Get started          | Send `/start`                                  |
-| Show help            | Send `/help`                                   |
-| Manage settings      | Send `/settings` to manage stats.fm & song.link|
-| Download current song| Send `/now` (requires stats.fm bound)          |
-| Search for a song    | Type a song name, e.g. `Numb Linkin Park`      |
-| Download by link     | Paste any supported URL (see below)            |
-| Pick a search result | Tap a number button (1–5)                      |
-| Browse result pages  | Use the ⬅️ / ➡️ buttons                        |
-| Cancel a search      | Tap the ❌ Cancel inline button                 |
+### Common issues
 
+- **"DUMP_CHAT_ID not configured"**: Add `DUMP_CHAT_ID=-100xxxxxxxxx` to your `.env` file
+- **"No inline_message_id available"**: Make sure inline feedback is enabled in @BotFather
+- **Download timeouts**: Large files may take longer to download - the bot has a 5-minute timeout
 
-## Supported Link Platforms
+## 📝 License
 
-| Platform                | Method                                                |
-| ----------------------- | ----------------------------------------------------- |
-| YouTube / YouTube Music | Direct (yt-dlp)                                       |
-| SoundCloud              | Direct (yt-dlp)                                       |
-| VK Music                | Direct (yt-dlp)                                       |
-| Spotify                 | Resolved via [song.link](https://song.link) → YouTube |
-| Yandex Music            | Resolved via [song.link](https://song.link) → YouTube |
-| Apple Music             | Resolved via [song.link](https://song.link) → YouTube |
-| Tidal                   | Resolved via [song.link](https://song.link) → YouTube |
-| Deezer                  | Resolved via [song.link](https://song.link) → YouTube |
-| song.link / odesli.co   | Resolved via [song.link](https://song.link) → YouTube |
-
-> Links starting with `http://` or `https://` are auto-detected — no special command needed.
-
-
+This project is for personal use. Please respect copyright laws and terms of service of the platforms you download from.
