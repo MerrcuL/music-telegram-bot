@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+.env
+audio_cache.db*
+cookies/
+musicbot_temp/
+*.log
+users_data.json*
+bot old.py

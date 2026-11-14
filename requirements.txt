@@ -1,0 +1,11 @@
+python-telegram-bot>=22.7
+python-dotenv
+ytmusicapi
+yt-dlp[default]
+cachetools
+peewee
+bgutil-ytdlp-pot-provider
+yt-dlp-ejs
+mutagen
+Pillow
+lyricsgenius
