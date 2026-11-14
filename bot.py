@@ -1440,7 +1440,7 @@ def base_yt_opts() -> dict:
     }
 
 
-def get_ydl_opts(user_id: int = None, use_cookies: bool = True) -> dict:
+def get_ydl_opts(user_id: int = None, use_cookies: bool = True, ad_free: bool = False) -> dict:
     # FFmpegExtractAudio only repackages the stream when its codec already matches
     # (no re-encode), so each format prefers the YouTube stream it can keep as-is.
     postprocessor_args = {}
@@ -1485,6 +1485,8 @@ def get_ydl_opts(user_id: int = None, use_cookies: bool = True) -> dict:
             # The * suffix includes formats with video tracks in the audio
             # quality ranking — FFmpegExtractAudio strips video anyway.
             opts['format'] = cookie_format
+    elif ad_free:
+        opts['extractor_args'] = {**opts['extractor_args'], 'youtube': {'player_client': AD_FREE_CLIENTS}}
     return opts
 
 
@@ -1733,13 +1735,14 @@ def download_song(opts: dict, video_id: str, url: str = None, cancel_event: thre
 
 
 async def run_download(user_id: int, video_id: str, url: str = None, use_cookies: bool = False,
-                       timeout: int = 300, on_info=None) -> dict:
+                       timeout: int = 300, on_info=None, ad_free: bool = False) -> dict:
     """Run download_song in a worker thread. On timeout the worker is told to stop too."""
     loop = asyncio.get_running_loop()
     cancel_event = threading.Event()
     future = loop.run_in_executor(
         None,
-        lambda: download_song(get_ydl_opts(user_id, use_cookies=use_cookies), video_id, url=url,
+        lambda: download_song(get_ydl_opts(user_id, use_cookies=use_cookies, ad_free=ad_free),
+                              video_id, url=url,
                               cancel_event=cancel_event, on_info=on_info),
     )
     try:
@@ -1749,34 +1752,64 @@ async def run_download(user_id: int, video_id: str, url: str = None, use_cookies
         raise
 
 
-async def download_preferring_cookies(user_id: int, video_id: str | None, url: str = None,
-                                      has_cookies: bool = False, on_fallback=None, on_info=None) -> dict:
+# YouTube clients that get no pre-roll ad. Signed-in clients all do, and yt-dlp must
+# then wait 5-6 s before YouTube serves the audio (requests before that get HTTP 403).
+# These clients only work without cookies, so they are used for the anonymous attempt.
+AD_FREE_CLIENTS = ['visionos', 'android_vr']
+# After an anonymous attempt hits YouTube's bot check, skip anonymous attempts for this long.
+ANON_RETRY_SECONDS = max(0, int(os.getenv("ANON_RETRY_MINUTES") or 60)) * 60
+_anon_blocked_until = 0.0
+
+
+def anonymous_blocked() -> bool:
+    return time.monotonic() < _anon_blocked_until
+
+
+def _block_anonymous():
+    global _anon_blocked_until
+    _anon_blocked_until = time.monotonic() + ANON_RETRY_SECONDS
+    logging.warning(f"YouTube bot check on an anonymous download: using cookies only for the next "
+                    f"{ANON_RETRY_SECONDS // 60} min")
+
+
+async def download_with_fallbacks(user_id: int, video_id: str | None, url: str = None,
+                                  has_cookies: bool = False, on_fallback=None, on_info=None) -> dict:
     """
-    Download with the user's cookies when they are set (signed-in requests get far fewer
-    bot checks), and fall back to an anonymous download if the signed-in one fails, e.g.
-    because the cookies expired or the account sees no usable formats.
-    on_fallback: optional coroutine function awaited before the second attempt.
+    Download a track, fastest way first:
+      1. Anonymous with ad-free clients: no ad wait. Skipped for ANON_RETRY_SECONDS after
+         YouTube answered one with its bot check.
+      2. With the user's cookies when set: signed-in requests pass the bot check far more
+         often, but wait out a pre-roll ad.
+         Without cookies: anonymous with yt-dlp's default clients instead.
+    Refusals (too long, playlists...) and timeouts are not retried. If every attempt fails,
+    the last error is raised (the cookie attempt's, when cookies are set).
+    on_fallback: optional coroutine function awaited before a retry.
     on_info: passed to download_song (may be called once per attempt).
     """
-    if not has_cookies:
-        return await run_download(user_id, video_id, url, use_cookies=False, on_info=on_info)
-    try:
-        return await run_download(user_id, video_id, url, use_cookies=True, on_info=on_info)
-    except (DownloadRejected, asyncio.TimeoutError, asyncio.CancelledError):
-        raise
-    except Exception as cookie_err:
-        logging.warning(f"Download with cookies failed for {video_id or url}: {cookie_err}; retrying without")
-        await cleanup_files(video_id)
-        if on_fallback is not None:
-            await on_fallback()
+    attempts = []
+    if not anonymous_blocked():
+        attempts.append(('ad-free', {'use_cookies': False, 'ad_free': True}))
+    attempts.append(('cookies', {'use_cookies': True}) if has_cookies
+                    else ('anonymous', {'use_cookies': False}))
+
+    last_error = None
+    for number, (label, kwargs) in enumerate(attempts):
+        if number:
+            await cleanup_files(video_id)
+            if on_fallback is not None:
+                await on_fallback()
         try:
-            return await run_download(user_id, video_id, url, use_cookies=False, on_info=on_info)
+            return await run_download(user_id, video_id, url, on_info=on_info, **kwargs)
         except (DownloadRejected, asyncio.TimeoutError, asyncio.CancelledError):
             raise
-        except Exception as plain_err:
-            logging.warning(f"Download without cookies also failed for {video_id or url}: {plain_err}")
-            # The signed-in attempt is the one that should have worked; its error says more.
-            raise cookie_err from plain_err
+        except Exception as e:
+            logging.warning(f"Download ({label}) failed for {video_id or url}: {e}")
+            last_error = e
+            if label == 'ad-free' and is_bot_check_error(str(e)):
+                _block_anonymous()
+                if not has_cookies:
+                    raise  # the default anonymous clients would get the same bot check
+    raise last_error
 
 
 def _is_file_of(fname: str, video_id: str) -> bool:
@@ -2526,10 +2559,10 @@ async def _process_download_and_upload(
     try:
         loop = asyncio.get_running_loop()
 
-        # Cookies first when they are set, anonymous download as the fallback.
+        # Ad-free anonymous download first, cookies as the fallback (see download_with_fallbacks).
         async def _announce_fallback():
             await status_msg.edit_text(
-                text="<tg-emoji emoji-id=\"5292226786229236118\">🔄</tg-emoji> Retrying without cookies...",
+                text="<tg-emoji emoji-id=\"5292226786229236118\">🔄</tg-emoji> Retrying...",
                 parse_mode='HTML'
             )
 
@@ -2553,7 +2586,7 @@ async def _process_download_and_upload(
 
         info = None
         try:
-            info = await download_preferring_cookies(user_id, video_id, download_url,
+            info = await download_with_fallbacks(user_id, video_id, download_url,
                                                      has_cookies=has_cookies, on_fallback=_announce_fallback,
                                                      on_info=_start_early_lookup)
         except DownloadRejected:
@@ -3933,12 +3966,12 @@ async def chosen_inline_result_handler(update: Update, context: ContextTypes.DEF
                     )
                 )
 
-                # Cookies first when they are set (same as regular mode).
+                # Ad-free anonymous download first, cookies as the fallback (same as regular mode).
                 info = None
                 try:
-                    info = await download_preferring_cookies(
+                    info = await download_with_fallbacks(
                         user_id, video_id, has_cookies=has_cookies,
-                        on_fallback=lambda: _update_status("Retrying without cookies..."),
+                        on_fallback=lambda: _update_status("Retrying..."),
                     )
                 except DownloadRejected as rejected:
                     logging.info(f"Inline: download refused for {video_id}: {rejected}")
