@@ -65,7 +65,7 @@ SPOTIFY_CLIENT_SECRET=
 | `SPOTIFY_CLIENT_ID` | Spotify Client ID, needed for the Spotify link button | ❌ Optional |
 | `SPOTIFY_CLIENT_SECRET` | Spotify Client Secret, needed for the Spotify link button | ❌ Optional |
 | `LASTFM_API_KEY` | Last.fm API Key, needed for the Last.fm integration | ❌ Optional |
-| `AUDIO_FORMAT` | `mp3` (default, 192 kbps) or `opus` (no re-encoding, but Telegram treats it as a voice message) | ❌ Optional |
+| `AUDIO_FORMAT` | `m4a` (default: YouTube's AAC audio without re-encoding, fastest and smallest), `mp3` (re-encoded at 192 kbps) or `opus` (no re-encoding, but Telegram treats it as a voice message) | ❌ Optional |
 | `BGUTIL_URL` | URL of the [bgutil PO token server](https://github.com/Brainicism/bgutil-ytdlp-pot-provider), default `http://127.0.0.1:4416` | ❌ Optional |
 
 ### Avoiding YouTube bot checks

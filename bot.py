@@ -62,14 +62,16 @@ COOKIES_DIR = os.path.join(BASE_DIR, "cookies")
 # Tracks longer than this are refused before download (Telegram bots can upload max 50 MB).
 MAX_DURATION_SECONDS = 600
 
-# "mp3":  re-encode everything to 192 kbps MP3 (default).
+# "m4a":  keep YouTube's original AAC audio without re-encoding (default). Fastest, smallest
+#         upload, no quality loss; full tags and cover art as MP4 atoms.
+# "mp3":  re-encode everything to 192 kbps MP3 (~2 s of CPU per song, ~1/3 bigger files).
 # "opus": keep YouTube's original Opus audio without re-encoding. Faster, but Telegram turns
 #         .opus uploads into voice messages, which fail with "Voice_messages_forbidden" for
 #         users who restrict voice messages. Do not enable unless that is acceptable.
-AUDIO_FORMAT = (os.getenv("AUDIO_FORMAT") or "mp3").strip().lower()
-if AUDIO_FORMAT not in ("opus", "mp3"):
-    print(f"Unknown AUDIO_FORMAT '{AUDIO_FORMAT}', falling back to mp3.")
-    AUDIO_FORMAT = "mp3"
+AUDIO_FORMAT = (os.getenv("AUDIO_FORMAT") or "m4a").strip().lower()
+if AUDIO_FORMAT not in ("m4a", "opus", "mp3"):
+    print(f"Unknown AUDIO_FORMAT '{AUDIO_FORMAT}', falling back to m4a.")
+    AUDIO_FORMAT = "m4a"
 _AUDIO_EXTENSIONS = ('.opus', '.mp3', '.m4a', '.ogg')
 
 
@@ -511,6 +513,8 @@ _genius_meta_cache = _LookupCache()
 _genius_lyrics_cache = _LookupCache()
 # Lets the Genius page scrape and the LRCLIB request run side by side.
 _LYRICS_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="lyrics")
+# Metadata lookups started from yt-dlp worker threads (no event loop there).
+_META_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="meta")
 
 
 def clear_lookup_caches():
@@ -1437,21 +1441,33 @@ def base_yt_opts() -> dict:
 
 
 def get_ydl_opts(user_id: int = None, use_cookies: bool = True) -> dict:
-    if AUDIO_FORMAT == 'opus':
-        # YouTube's best audio is already Opus: FFmpegExtractAudio then only repackages it
-        # into an .opus file (no re-encode). Other codecs get converted to Opus.
+    # FFmpegExtractAudio only repackages the stream when its codec already matches
+    # (no re-encode), so each format prefers the YouTube stream it can keep as-is.
+    postprocessor_args = {}
+    if AUDIO_FORMAT == 'm4a':
+        # YouTube's AAC stream (format 140) goes into .m4a untouched: no encoding time,
+        # no generation loss, ~1/3 smaller than 192k MP3. Other codecs get converted to AAC.
+        audio_format, codec, quality = 'bestaudio[ext=m4a]/bestaudio/best', 'm4a', '192'
+        cookie_format = 'bestaudio[ext=m4a]/bestaudio*/best'
+    elif AUDIO_FORMAT == 'opus':
+        # YouTube's best audio is already Opus: it is only repackaged into an .opus file.
         audio_format, codec, quality = 'bestaudio[acodec=opus]/bestaudio/best', 'opus', '160'
+        cookie_format = 'bestaudio[acodec=opus]/bestaudio*/best'
     else:
         audio_format, codec, quality = 'bestaudio/best', 'mp3', '192'
+        cookie_format = 'bestaudio*/best'
+        # LAME's "fast" preset: about twice as fast as the default at the same bitrate.
+        postprocessor_args = {'extractaudio+ffmpeg_o': ['-compression_level', '7']}
     opts = {
         'format': audio_format,
         'outtmpl': f'{DOWNLOAD_DIR}/%(id)s.%(ext)s',
-        'writethumbnail': True,
+        # No writethumbnail: the video thumbnail is only the last cover art fallback,
+        # so it is fetched from info['thumbnail'] when it is actually needed.
         'postprocessors': [
             {'key': 'FFmpegExtractAudio', 'preferredcodec': codec, 'preferredquality': quality},
-            {'key': 'FFmpegThumbnailsConvertor', 'format': 'jpg'},
             {'key': 'FFmpegMetadata'},
         ],
+        'postprocessor_args': postprocessor_args,
         'progress_hooks': [artists_cleaner_hook],
         'quiet': True,
         'noprogress': True,
@@ -1468,8 +1484,7 @@ def get_ydl_opts(user_id: int = None, use_cookies: bool = True) -> dict:
             opts['cookiefile'] = cookies_path
             # The * suffix includes formats with video tracks in the audio
             # quality ranking — FFmpegExtractAudio strips video anyway.
-            opts['format'] = ('bestaudio[acodec=opus]/bestaudio*/best' if AUDIO_FORMAT == 'opus'
-                              else 'bestaudio*/best')
+            opts['format'] = cookie_format
     return opts
 
 
@@ -1672,7 +1687,9 @@ async def video_lock(key: str | None):
 
 
 # --- HELPER: DOWNLOAD SONG BY VIDEO ID ---
-def download_song(opts: dict, video_id: str, url: str = None, cancel_event: threading.Event = None) -> dict:
+def download_song(opts: dict, video_id: str, url: str = None, cancel_event: threading.Event = None,
+                  on_info=None) -> dict:
+    """on_info(info): called (in this worker thread) once the track is known, before the download."""
     # Use www.youtube.com instead of music.youtube.com to avoid
     # YouTube Music-specific format restrictions with authenticated sessions
     download_url = url or f"https://www.youtube.com/watch?v={video_id}"
@@ -1705,20 +1722,25 @@ def download_song(opts: dict, video_id: str, url: str = None, cancel_event: thre
         _check(raw)
         info = ydl.process_ie_result(raw, download=False)
         _check(info)
+        if on_info is not None:
+            try:
+                on_info(info)
+            except Exception as e:  # never let a metadata helper break the download
+                logging.debug(f"on_info callback failed: {e}")
         if cancel_event is not None and cancel_event.is_set():
             raise yt_dlp.utils.DownloadCancelled("Download cancelled (timed out)")
         return ydl.process_ie_result(info, download=True)
 
 
 async def run_download(user_id: int, video_id: str, url: str = None, use_cookies: bool = False,
-                       timeout: int = 300) -> dict:
+                       timeout: int = 300, on_info=None) -> dict:
     """Run download_song in a worker thread. On timeout the worker is told to stop too."""
     loop = asyncio.get_running_loop()
     cancel_event = threading.Event()
     future = loop.run_in_executor(
         None,
         lambda: download_song(get_ydl_opts(user_id, use_cookies=use_cookies), video_id, url=url,
-                              cancel_event=cancel_event),
+                              cancel_event=cancel_event, on_info=on_info),
     )
     try:
         return await asyncio.wait_for(future, timeout=timeout)
@@ -1728,17 +1750,18 @@ async def run_download(user_id: int, video_id: str, url: str = None, use_cookies
 
 
 async def download_preferring_cookies(user_id: int, video_id: str | None, url: str = None,
-                                      has_cookies: bool = False, on_fallback=None) -> dict:
+                                      has_cookies: bool = False, on_fallback=None, on_info=None) -> dict:
     """
     Download with the user's cookies when they are set (signed-in requests get far fewer
     bot checks), and fall back to an anonymous download if the signed-in one fails, e.g.
     because the cookies expired or the account sees no usable formats.
     on_fallback: optional coroutine function awaited before the second attempt.
+    on_info: passed to download_song (may be called once per attempt).
     """
     if not has_cookies:
-        return await run_download(user_id, video_id, url, use_cookies=False)
+        return await run_download(user_id, video_id, url, use_cookies=False, on_info=on_info)
     try:
-        return await run_download(user_id, video_id, url, use_cookies=True)
+        return await run_download(user_id, video_id, url, use_cookies=True, on_info=on_info)
     except (DownloadRejected, asyncio.TimeoutError, asyncio.CancelledError):
         raise
     except Exception as cookie_err:
@@ -1747,7 +1770,7 @@ async def download_preferring_cookies(user_id: int, video_id: str | None, url: s
         if on_fallback is not None:
             await on_fallback()
         try:
-            return await run_download(user_id, video_id, url, use_cookies=False)
+            return await run_download(user_id, video_id, url, use_cookies=False, on_info=on_info)
         except (DownloadRejected, asyncio.TimeoutError, asyncio.CancelledError):
             raise
         except Exception as plain_err:
@@ -1910,6 +1933,7 @@ async def _get_artwork_pair(
     cover_url: str = None,
     genius_cover_url: str = None,
     genius_checked: bool = False,
+    thumbnail_url: str = None,
 ) -> tuple[bytes | None, bytes | None]:
     """
     Get the synchronized (embed_cover_bytes, telegram_thumb_bytes) pair.
@@ -1918,11 +1942,12 @@ async def _get_artwork_pair(
     genius_cover_url -- Genius artwork already resolved by the metadata pipeline.
     genius_checked   -- True if Genius already matched this track, so a second
                         lookup would be redundant (e.g. matched but no artwork).
+    thumbnail_url    -- the video's own thumbnail (yt-dlp info['thumbnail']).
 
     Priority (first source that yields a valid image wins):
       1. Genius high-resolution cover art (default)
       2. Direct provider cover_url
-      3. Local yt-dlp downloaded thumbnail on disk (cropped to square)
+      3. The video thumbnail (a local file if one exists, else thumbnail_url), cropped to square
     """
     loop = asyncio.get_running_loop()
 
@@ -1942,8 +1967,13 @@ async def _get_artwork_pair(
                 data = _fetch_artwork_from_url(cover_url)
             return data
         sources.append(_provider_source)
-    if video_id:
-        sources.append(lambda: _read_local_thumbnail(video_id))
+    if video_id or thumbnail_url:
+        def _thumbnail_source():
+            data = _read_local_thumbnail(video_id) if video_id else None
+            if not data and thumbnail_url and thumbnail_url not in (cover_url, genius_cover_url):
+                data = _fetch_artwork_from_url(thumbnail_url)
+            return data
+        sources.append(_thumbnail_source)
 
     for source in sources:
         raw_bytes = await loop.run_in_executor(None, source)
@@ -1979,10 +2009,15 @@ def _prepare_and_embed_metadata(
     Removes existing conflicting APIC and USLT frames and saves in ID3v2.3 format
     so that Android MediaSession / Pixel notification and lockscreen players
     and desktop music players consistently read the exact same artwork, metadata, and lyrics.
-    Opus files get the same information as Vorbis comments instead.
+    Opus files get the same information as Vorbis comments, M4A files as MP4 atoms.
     """
+    other_writer = None
     if file_path.lower().endswith(('.opus', '.ogg')):
-        _embed_opus_metadata(
+        other_writer = _embed_opus_metadata
+    elif file_path.lower().endswith(('.m4a', '.mp4')):
+        other_writer = _embed_m4a_metadata
+    if other_writer is not None:
+        other_writer(
             file_path, title=title, artist=artist, cover_bytes=cover_bytes, album=album,
             album_artist=album_artist, release_date=release_date, lyrics=lyrics,
             composer=composer, lyricist=lyricist,
@@ -2027,6 +2062,53 @@ def _prepare_and_embed_metadata(
 
         tags.save(file_path, v2_version=3)
         logging.debug(f"Successfully embedded clean ID3v2.3 metadata into {file_path}")
+    except Exception as e:
+        logging.warning(f"Failed to embed metadata/album art into {file_path}: {e}")
+
+
+def _embed_m4a_metadata(
+    file_path: str,
+    title: str = None,
+    artist: str = None,
+    cover_bytes: bytes = None,
+    album: str = None,
+    album_artist: str = None,
+    release_date: str = None,
+    lyrics: str = None,
+    composer: str = None,
+    lyricist: str = None,
+) -> None:
+    """Write title / artist / album / lyrics / cover art into an M4A (MP4) file as iTunes-style atoms."""
+    try:
+        from mutagen.mp4 import MP4, MP4Cover, MP4FreeForm
+
+        audio = MP4(file_path)
+        if audio.tags is None:
+            audio.add_tags()
+        tags = audio.tags
+        # yt-dlp copies the whole video description into the file; it is not music metadata.
+        for junk in ('desc', 'ldes', '\xa9cmt', 'purl', 'egid'):
+            tags.pop(junk, None)
+
+        fields = {
+            '\xa9nam': title, '\xa9ART': artist, '\xa9alb': album, 'aART': album_artist,
+            '\xa9day': str(release_date) if release_date else None,
+            '\xa9wrt': composer, '\xa9lyr': lyrics,
+        }
+        for key, value in fields.items():
+            if value:
+                tags[key] = [value]
+        if lyricist:
+            # No standard atom for the lyricist: the freeform key Picard / MusicBrainz use.
+            tags['----:com.apple.iTunes:LYRICIST'] = [
+                MP4FreeForm(lyricist.encode('utf-8'), dataformat=MP4FreeForm.FORMAT_TEXT)
+            ]
+        if cover_bytes:
+            fmt = MP4Cover.FORMAT_PNG if cover_bytes[:4] == b'\x89PNG' else MP4Cover.FORMAT_JPEG
+            tags['covr'] = [MP4Cover(cover_bytes, imageformat=fmt)]
+
+        audio.save()
+        logging.debug(f"Successfully embedded MP4 metadata into {file_path}")
     except Exception as e:
         logging.warning(f"Failed to embed metadata/album art into {file_path}: {e}")
 
@@ -2217,6 +2299,7 @@ async def send_downloaded_audio(
     embed_lyrics: str = None,
     metadata: dict = None,
     reply_markup: InlineKeyboardMarkup = None,
+    thumbnail_url: str = None,
 ) -> bool:
     """Send audio to the user, using DB cache if available."""
     loop = asyncio.get_running_loop()
@@ -2292,6 +2375,7 @@ async def send_downloaded_audio(
         video_id, artist=uploader, track=song_title, cover_url=cover_url,
         genius_cover_url=genius_meta.get('cover_url'),
         genius_checked=bool(genius_meta.get('matched')),
+        thumbnail_url=thumbnail_url,
     )
 
     # Embed clean ID3v2.3 tags and album art into MP3 file
@@ -2449,10 +2533,29 @@ async def _process_download_and_upload(
                 parse_mode='HTML'
             )
 
+        # Without a known title (plain links) the first metadata lookup has nothing to
+        # search for. Start the real one as soon as yt-dlp has read the page, so it runs
+        # alongside the audio download instead of after it.
+        early_lookup: dict = {}
+
+        def _start_early_lookup(found_info: dict):  # runs in the yt-dlp worker thread
+            if fallback_title or 'future' in early_lookup:
+                return
+            found_title, found_artist = yt_metadata(found_info)
+            early_lookup['future'] = _META_POOL.submit(
+                _fetch_metadata_bundle,
+                video_id=video_id or found_info.get('id'),
+                artist=found_artist,
+                track=found_title,
+                original_url=original_url,
+                include_lyrics=include_lyrics,
+            )
+
         info = None
         try:
             info = await download_preferring_cookies(user_id, video_id, download_url,
-                                                     has_cookies=has_cookies, on_fallback=_announce_fallback)
+                                                     has_cookies=has_cookies, on_fallback=_announce_fallback,
+                                                     on_info=_start_early_lookup)
         except DownloadRejected:
             raise
         except asyncio.TimeoutError:
@@ -2491,15 +2594,18 @@ async def _process_download_and_upload(
         # and Genius was not matched yet, attempt quick match using info_title / info_artist
         if not genius_data.get('matched') and (info_title or info_artist):
             try:
-                late_bundle = await loop.run_in_executor(
-                    None, lambda: _fetch_metadata_bundle(
-                        video_id=video_id,
-                        artist=info_artist,
-                        track=info_title,
-                        original_url=original_url,
-                        include_lyrics=include_lyrics,
+                if 'future' in early_lookup:
+                    late_bundle = await asyncio.wrap_future(early_lookup['future'])
+                else:
+                    late_bundle = await loop.run_in_executor(
+                        None, lambda: _fetch_metadata_bundle(
+                            video_id=video_id,
+                            artist=info_artist,
+                            track=info_title,
+                            original_url=original_url,
+                            include_lyrics=include_lyrics,
+                        )
                     )
-                )
                 if late_bundle.get('genius', {}).get('matched'):
                     genius_data = late_bundle['genius']
                     if not lyrics:
@@ -2535,6 +2641,7 @@ async def _process_download_and_upload(
             lyrics=lyrics,
             embed_lyrics=embed_lyrics,
             metadata=genius_data,
+            thumbnail_url=info.get('thumbnail'),
         )
 
         if success:
@@ -3873,6 +3980,7 @@ async def chosen_inline_result_handler(update: Update, context: ContextTypes.DEF
                     cover_url=track.get('cover_url'),
                     genius_cover_url=genius_data.get('cover_url'),
                     genius_checked=bool(genius_data.get('matched')),
+                    thumbnail_url=info.get('thumbnail'),
                 )
 
                 # Embed clean ID3v2.3 tags and album art into MP3 file (always uses LRCLIB for lyrics)
